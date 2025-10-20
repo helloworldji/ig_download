@@ -10,6 +10,7 @@ aiohttp==3.10.11
 """
 
 import os
+import re  # Add this with other imports at the top
 import sys
 import logging
 import asyncio
