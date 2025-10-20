@@ -204,16 +204,10 @@ data_manager = DataManager()
 # ==================== VIDEO DOWNLOADER (API-BASED) ====================
 
 class VideoDownloader:
-    """Downloads videos using Cobalt API"""
+    """Downloads videos using multiple APIs with fallbacks"""
     
     def __init__(self):
         self.temp_dir = DOWNLOADS_DIR
-        
-        # Multiple Cobalt API instances for reliability
-        self.apis = [
-            "https://api.cobalt.tools/api/json",
-            "https://co.wuk.sh/api/json",
-        ]
     
     def get_platform(self, url: str) -> str:
         """Detect platform from URL"""
@@ -235,10 +229,6 @@ class VideoDownloader:
             return 'Pinterest'
         elif 'vimeo.com' in url:
             return 'Vimeo'
-        elif 'streamable.com' in url:
-            return 'Streamable'
-        elif 'soundcloud.com' in url:
-            return 'SoundCloud'
         
         return 'Unknown'
     
@@ -253,74 +243,202 @@ class VideoDownloader:
             size /= 1024
         return f"{size:.1f} TB"
     
-    async def get_download_url(self, url: str, quality: str = "720") -> Optional[str]:
-        """Get direct download URL from Cobalt API"""
+    async def download_with_api1(self, url: str, quality: str = "720") -> Optional[str]:
+        """Try API 1: social-download-all-in-one"""
         
-        # Prepare request
-        is_audio = quality == "audio"
-        
-        payload = {
-            "url": url,
-            "vQuality": quality if not is_audio else "720",
-            "isAudioOnly": is_audio,
-            "aFormat": "mp3",
-            "filenamePattern": "basic",
-            "downloadMode": "auto"
-        }
-        
-        headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0'
-        }
-        
-        # Try each API endpoint
-        for api_url in self.apis:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        api_url,
-                        json=payload,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=30)
-                    ) as response:
-                        
-                        if response.status != 200:
-                            logger.warning(f"API {api_url} returned {response.status}")
-                            continue
-                        
+        try:
+            api_url = "https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink"
+            
+            headers = {
+                "content-type": "application/json",
+            }
+            
+            payload = {"url": url}
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    api_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    
+                    if response.status == 200:
                         data = await response.json()
                         
-                        # Check response status
-                        status = data.get('status')
-                        
-                        if status == 'error':
-                            logger.error(f"Cobalt error: {data.get('text', 'Unknown error')}")
-                            continue
-                        
-                        # Get download URL
-                        if status in ['redirect', 'stream']:
-                            download_url = data.get('url')
+                        # Extract download URL
+                        if 'medias' in data and len(data['medias']) > 0:
+                            media = data['medias'][0]
+                            download_url = media.get('url')
                             if download_url:
+                                logger.info("API1 success")
                                 return download_url
                         
-                        # Handle picker (multiple options)
+        except Exception as e:
+            logger.error(f"API1 failed: {e}")
+        
+        return None
+    
+    async def download_with_api2(self, url: str, quality: str = "720") -> Optional[str]:
+        """Try API 2: SaveFrom.net"""
+        
+        try:
+            # SaveFrom API endpoint
+            api_url = f"https://api.savefrom.net/info?url={url}"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    api_url,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    
+                    if response.status == 200:
+                        text = await response.text()
+                        
+                        # Parse response (JSON-like format)
+                        import json
+                        try:
+                            # Extract JSON from callback
+                            if '(' in text:
+                                json_str = text.split('(', 1)[1].rsplit(')', 1)[0]
+                                data = json.loads(json_str)
+                                
+                                if 'url' in data and len(data['url']) > 0:
+                                    video = data['url'][0]
+                                    download_url = video.get('url')
+                                    if download_url:
+                                        logger.info("API2 success")
+                                        return download_url
+                        except:
+                            pass
+                        
+        except Exception as e:
+            logger.error(f"API2 failed: {e}")
+        
+        return None
+    
+    async def download_with_api3(self, url: str, quality: str = "720") -> Optional[str]:
+        """Try API 3: DownloadGram (Instagram specific)"""
+        
+        if 'instagram.com' not in url.lower():
+            return None
+        
+        try:
+            api_url = "https://downloadgram.org/reel-downloader.php"
+            
+            payload = {
+                "url": url,
+                "submit": ""
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    api_url,
+                    data=payload,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    
+                    if response.status == 200:
+                        text = await response.text()
+                        
+                        # Extract download link from HTML
+                        import re
+                        matches = re.findall(r'href="(https://[^"]+\.mp4[^"]*)"', text)
+                        
+                        if matches:
+                            logger.info("API3 success")
+                            return matches[0]
+                        
+        except Exception as e:
+            logger.error(f"API3 failed: {e}")
+        
+        return None
+    
+    async def download_with_cobalt_fixed(self, url: str, quality: str = "720") -> Optional[str]:
+        """Try Cobalt API with fixed format"""
+        
+        try:
+            # Use the new Cobalt API v9 format
+            api_url = "https://api.cobalt.tools/api/json"
+            
+            is_audio = quality == "audio"
+            
+            # Simplified payload
+            payload = {
+                "url": url,
+                "vQuality": "max" if quality == "max" else quality,
+                "filenamePattern": "classic",
+                "isAudioOnly": is_audio,
+                "aFormat": "mp3" if is_audio else "best",
+                "isAudioMuted": False,
+                "dubLang": False
+            }
+            
+            headers = {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    api_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        status = data.get('status')
+                        
+                        if status == 'stream' or status == 'redirect':
+                            download_url = data.get('url')
+                            if download_url:
+                                logger.info("Cobalt API success")
+                                return download_url
+                        
                         elif status == 'picker':
                             picker = data.get('picker', [])
-                            if picker and len(picker) > 0:
+                            if picker:
+                                logger.info("Cobalt picker success")
                                 return picker[0].get('url')
+                    
+                    else:
+                        error_text = await response.text()
+                        logger.warning(f"Cobalt returned {response.status}: {error_text[:200]}")
                         
-                        # Handle tunnel
-                        elif status == 'tunnel':
-                            return data.get('url')
-                
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout with API {api_url}")
-                continue
-            except Exception as e:
-                logger.error(f"Error with API {api_url}: {e}")
-                continue
+        except Exception as e:
+            logger.error(f"Cobalt failed: {e}")
         
+        return None
+    
+    async def get_download_url(self, url: str, quality: str = "720") -> Optional[str]:
+        """Try all APIs in sequence"""
+        
+        logger.info(f"Attempting download for: {url}")
+        
+        # Try Cobalt first (most reliable when it works)
+        download_url = await self.download_with_cobalt_fixed(url, quality)
+        if download_url:
+            return download_url
+        
+        # Try API 1
+        download_url = await self.download_with_api1(url, quality)
+        if download_url:
+            return download_url
+        
+        # Try API 2
+        download_url = await self.download_with_api2(url, quality)
+        if download_url:
+            return download_url
+        
+        # Try API 3 (Instagram specific)
+        download_url = await self.download_with_api3(url, quality)
+        if download_url:
+            return download_url
+        
+        logger.error("All APIs failed")
         return None
     
     async def download_file(self, download_url: str, is_audio: bool = False) -> Optional[str]:
@@ -331,9 +449,14 @@ class VideoDownloader:
         filepath = os.path.join(self.temp_dir, filename)
         
         try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     download_url,
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=300)
                 ) as response:
                     
@@ -341,7 +464,7 @@ class VideoDownloader:
                         logger.error(f"Download failed: HTTP {response.status}")
                         return None
                     
-                    # Download file
+                    # Download file in chunks
                     with open(filepath, 'wb') as f:
                         async for chunk in response.content.iter_chunked(8192):
                             f.write(chunk)
@@ -362,12 +485,14 @@ class VideoDownloader:
         """Main download function"""
         
         try:
-            # Get download URL from API
+            # Get download URL from APIs
             download_url = await self.get_download_url(url, quality)
             
             if not download_url:
-                logger.error("Failed to get download URL from API")
+                logger.error("Failed to get download URL from any API")
                 return None
+            
+            logger.info(f"Got download URL: {download_url[:100]}")
             
             # Download the file
             is_audio = quality == "audio"
@@ -398,11 +523,9 @@ class VideoDownloader:
                     age = now - os.path.getmtime(filepath)
                     if age > 3600:  # 1 hour
                         os.remove(filepath)
+                        logger.info(f"Cleaned old: {filename}")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
-
-downloader = VideoDownloader()
-
 # ==================== COMMAND HANDLERS ====================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
