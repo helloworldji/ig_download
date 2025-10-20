@@ -1,66 +1,47 @@
 #!/usr/bin/env python3
 """
-Telegram Video Downloader Bot - API-Based Version
-==================================================
-Uses Cobalt API to bypass all platform restrictions
-
-REQUIREMENTS:
-python-telegram-bot==21.5
-aiohttp==3.10.11
+Telegram Video Downloader Bot - Production Version
+===================================================
+Complete rewrite with web server for Render.com
+Uses yt-dlp with optimal configuration
 """
 
 import os
-import re  # Add this with other imports at the top
 import sys
 import logging
 import asyncio
 import json
 import time
-import re
 from datetime import datetime
-from typing import Dict, List, Optional, Set
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import Dict, Optional, Set
 
-# Telegram imports
-from telegram import (
-    Update, 
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup,
-    BotCommand
-)
+# Web server
+from aiohttp import web
+
+# Telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.error import TelegramError
 
-# For async HTTP requests
-import aiohttp
+# Video downloader
+import yt_dlp
 
 # ==================== CONFIGURATION ====================
 
-# Bot Configuration
 BOT_TOKEN = "8367293218:AAF7VsjU0jkzoU8DLd1kX75Kr73hXrKiq94"
 ADMIN_ID = 8175884349
-WEBHOOK_URL = ""  # Leave empty for polling mode
-
 PORT = int(os.getenv('PORT', '10000'))
 
-# File paths
-AUTHORIZED_USERS_FILE = 'authorized_users.json'
+AUTHORIZED_USERS_FILE = 'users.json'
 STATS_FILE = 'stats.json'
 DOWNLOADS_DIR = 'downloads'
+TELEGRAM_FILE_LIMIT = 50 * 1024 * 1024  # 50MB
 
-# Telegram file size limit
-TELEGRAM_FILE_SIZE_LIMIT = 50 * 1024 * 1024
-
-# Create downloads directory
 Path(DOWNLOADS_DIR).mkdir(exist_ok=True)
 
 # ==================== LOGGING ====================
@@ -71,484 +52,248 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+logging.getLogger('httpx').setLevel(logging.WARNING)
 
-# ==================== MESSAGES ====================
+# ==================== WEB SERVER (for Render health checks) ====================
 
-WELCOME_MESSAGE = """
-🎬 **Welcome to Video Downloader Bot!**
+async def health_check(request):
+    """Health check endpoint for Render"""
+    return web.Response(text="Bot is running!")
 
-I can download videos from:
-• YouTube
-• Instagram 
-• TikTok
-• Twitter/X
-• Facebook
-• Reddit
-• Pinterest
-• Vimeo
-• And many more!
-
-**How to use:**
-1. Send me a video URL
-2. Choose quality
-3. Get your video!
-
-Type /help for more info.
-"""
-
-HELP_MESSAGE = """
-📖 **How to Use**
-
-**Download Videos:**
-1. Send any video URL
-2. Select quality (1080p, 720p, 480p, etc.)
-3. Receive your video!
-
-**Commands:**
-/start - Start the bot
-/help - Show this help
-/stats - Your statistics
-/platforms - Supported platforms
-
-**Admin Commands:**
-/adduser <id> - Add user
-/removeuser <id> - Remove user
-/listusers - List users
-/globalstats - Global stats
-
-**Supported Platforms:**
-YouTube, Instagram, TikTok, Twitter, Facebook, Reddit, Vimeo, Pinterest, Streamable, SoundCloud, and more!
-
-**Tips:**
-• Use lower quality for long videos
-• Audio only option for music
-• 50MB Telegram file limit
-
-Enjoy! 🚀
-"""
+async def start_web_server():
+    """Start web server for Render health checks"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"✅ Web server started on port {PORT}")
 
 # ==================== DATA MANAGER ====================
 
 class DataManager:
     def __init__(self):
-        self.authorized_users: Set[int] = self.load_authorized_users()
+        self.authorized_users: Set[int] = self.load_users()
         self.stats: Dict = self.load_stats()
     
-    def load_authorized_users(self) -> Set[int]:
+    def load_users(self) -> Set[int]:
         try:
             if os.path.exists(AUTHORIZED_USERS_FILE):
-                with open(AUTHORIZED_USERS_FILE, 'r') as f:
+                with open(AUTHORIZED_USERS_FILE) as f:
                     data = json.load(f)
                     users = set(data.get('users', []))
                     users.add(ADMIN_ID)
                     return users
-            return {ADMIN_ID}
         except Exception as e:
-            logger.error(f"Error loading users: {e}")
-            return {ADMIN_ID}
+            logger.error(f"Load users error: {e}")
+        return {ADMIN_ID}
     
-    def save_authorized_users(self):
+    def save_users(self):
         try:
             with open(AUTHORIZED_USERS_FILE, 'w') as f:
                 json.dump({'users': list(self.authorized_users)}, f)
         except Exception as e:
-            logger.error(f"Error saving users: {e}")
+            logger.error(f"Save users error: {e}")
     
     def load_stats(self) -> Dict:
         try:
             if os.path.exists(STATS_FILE):
-                with open(STATS_FILE, 'r') as f:
+                with open(STATS_FILE) as f:
                     return json.load(f)
-            return {
-                'total_downloads': 0,
-                'user_downloads': {},
-                'platform_stats': {},
-            }
-        except Exception:
-            return {'total_downloads': 0, 'user_downloads': {}, 'platform_stats': {}}
+        except:
+            pass
+        return {'total': 0, 'users': {}, 'platforms': {}}
     
     def save_stats(self):
         try:
             with open(STATS_FILE, 'w') as f:
                 json.dump(self.stats, f)
         except Exception as e:
-            logger.error(f"Error saving stats: {e}")
+            logger.error(f"Save stats error: {e}")
     
     def add_user(self, user_id: int):
         self.authorized_users.add(user_id)
-        self.save_authorized_users()
+        self.save_users()
     
     def remove_user(self, user_id: int):
-        if user_id != ADMIN_ID and user_id in self.authorized_users:
-            self.authorized_users.remove(user_id)
-            self.save_authorized_users()
+        if user_id != ADMIN_ID:
+            self.authorized_users.discard(user_id)
+            self.save_users()
     
     def is_authorized(self, user_id: int) -> bool:
         return user_id in self.authorized_users
     
-    def record_download(self, user_id: int, platform: str, quality: str):
-        self.stats['total_downloads'] = self.stats.get('total_downloads', 0) + 1
+    def record_download(self, user_id: int, platform: str):
+        self.stats['total'] = self.stats.get('total', 0) + 1
         
-        user_stats = self.stats.get('user_downloads', {})
-        user_stats[str(user_id)] = user_stats.get(str(user_id), 0) + 1
-        self.stats['user_downloads'] = user_stats
+        users = self.stats.get('users', {})
+        users[str(user_id)] = users.get(str(user_id), 0) + 1
+        self.stats['users'] = users
         
-        platform_stats = self.stats.get('platform_stats', {})
-        platform_stats[platform] = platform_stats.get(platform, 0) + 1
-        self.stats['platform_stats'] = platform_stats
+        platforms = self.stats.get('platforms', {})
+        platforms[platform] = platforms.get(platform, 0) + 1
+        self.stats['platforms'] = platforms
         
         self.save_stats()
 
 data_manager = DataManager()
 
-# ==================== VIDEO DOWNLOADER (API-BASED) ====================
+# ==================== VIDEO DOWNLOADER ====================
 
 class VideoDownloader:
-    """Downloads videos using multiple APIs with fallbacks"""
-    
     def __init__(self):
         self.temp_dir = DOWNLOADS_DIR
     
     def get_platform(self, url: str) -> str:
-        """Detect platform from URL"""
-        url = url.lower()
+        url_lower = url.lower()
+        platforms = {
+            'youtube.com': 'YouTube', 'youtu.be': 'YouTube',
+            'instagram.com': 'Instagram',
+            'tiktok.com': 'TikTok',
+            'twitter.com': 'Twitter', 'x.com': 'Twitter',
+            'facebook.com': 'Facebook',
+            'reddit.com': 'Reddit',
+            'vimeo.com': 'Vimeo',
+            'pinterest.com': 'Pinterest',
+        }
         
-        if 'youtube.com' in url or 'youtu.be' in url:
-            return 'YouTube'
-        elif 'instagram.com' in url:
-            return 'Instagram'
-        elif 'tiktok.com' in url:
-            return 'TikTok'
-        elif 'twitter.com' in url or 'x.com' in url:
-            return 'Twitter'
-        elif 'facebook.com' in url:
-            return 'Facebook'
-        elif 'reddit.com' in url:
-            return 'Reddit'
-        elif 'pinterest.com' in url:
-            return 'Pinterest'
-        elif 'vimeo.com' in url:
-            return 'Vimeo'
-        
-        return 'Unknown'
+        for key, platform in platforms.items():
+            if key in url_lower:
+                return platform
+        return 'Other'
     
     def format_bytes(self, size: int) -> str:
-        """Format bytes to readable size"""
         if not size:
             return "Unknown"
-        
         for unit in ['B', 'KB', 'MB', 'GB']:
             if size < 1024:
                 return f"{size:.1f} {unit}"
             size /= 1024
         return f"{size:.1f} TB"
     
-    async def download_with_api1(self, url: str, quality: str = "720") -> Optional[str]:
-        """Try API 1: social-download-all-in-one"""
+    def get_ydl_opts(self, quality: str = "720", audio_only: bool = False):
+        """Get yt-dlp options with anti-detection"""
         
-        try:
-            api_url = "https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink"
+        opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': 'bestaudio/best' if audio_only else f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best',
+            'outtmpl': os.path.join(self.temp_dir, f'{int(time.time())}_%(id)s.%(ext)s'),
+            'merge_output_format': 'mp4',
+            'socket_timeout': 30,
+            'retries': 10,
+            'fragment_retries': 10,
+            'http_chunk_size': 10485760,
             
-            headers = {
-                "content-type": "application/json",
-            }
+            # Anti-bot detection
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'referer': 'https://www.google.com/',
             
-            payload = {"url": url}
+            # Extractor args for different platforms
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web'],
+                    'player_skip': ['webpage'],
+                },
+                'instagram': {
+                    'api_mode': 'browser',
+                }
+            },
             
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    api_url,
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    
-                    if response.status == 200:
-                        data = await response.json()
-                        
-                        # Extract download URL
-                        if 'medias' in data and len(data['medias']) > 0:
-                            media = data['medias'][0]
-                            download_url = media.get('url')
-                            if download_url:
-                                logger.info("API1 success")
-                                return download_url
-                        
-        except Exception as e:
-            logger.error(f"API1 failed: {e}")
+            # Cookies and headers
+            'cookiesfrombrowser': None,
+            'nocheckcertificate': True,
+            'age_limit': None,
+        }
         
-        return None
+        if audio_only:
+            opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+            opts['format'] = 'bestaudio/best'
+        
+        return opts
     
-    async def download_with_api2(self, url: str, quality: str = "720") -> Optional[str]:
-        """Try API 2: SaveFrom.net"""
-        
+    async def download(self, url: str, quality: str = "720") -> Optional[str]:
+        """Download video"""
         try:
-            # SaveFrom API endpoint
-            api_url = f"https://api.savefrom.net/info?url={url}"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    api_url,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    
-                    if response.status == 200:
-                        text = await response.text()
-                        
-                        # Parse response (JSON-like format)
-                        import json
-                        try:
-                            # Extract JSON from callback
-                            if '(' in text:
-                                json_str = text.split('(', 1)[1].rsplit(')', 1)[0]
-                                data = json.loads(json_str)
-                                
-                                if 'url' in data and len(data['url']) > 0:
-                                    video = data['url'][0]
-                                    download_url = video.get('url')
-                                    if download_url:
-                                        logger.info("API2 success")
-                                        return download_url
-                        except:
-                            pass
-                        
-        except Exception as e:
-            logger.error(f"API2 failed: {e}")
-        
-        return None
-    
-    async def download_with_api3(self, url: str, quality: str = "720") -> Optional[str]:
-        """Try API 3: DownloadGram (Instagram specific)"""
-        
-        if 'instagram.com' not in url.lower():
-            return None
-        
-        try:
-            api_url = "https://downloadgram.org/reel-downloader.php"
-            
-            payload = {
-                "url": url,
-                "submit": ""
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    api_url,
-                    data=payload,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    
-                    if response.status == 200:
-                        text = await response.text()
-                        
-                        # Extract download link from HTML
-                        import re
-                        matches = re.findall(r'href="(https://[^"]+\.mp4[^"]*)"', text)
-                        
-                        if matches:
-                            logger.info("API3 success")
-                            return matches[0]
-                        
-        except Exception as e:
-            logger.error(f"API3 failed: {e}")
-        
-        return None
-    
-    async def download_with_cobalt_fixed(self, url: str, quality: str = "720") -> Optional[str]:
-        """Try Cobalt API with fixed format"""
-        
-        try:
-            # Use the new Cobalt API v9 format
-            api_url = "https://api.cobalt.tools/api/json"
-            
             is_audio = quality == "audio"
+            opts = self.get_ydl_opts(quality, is_audio)
             
-            # Simplified payload
-            payload = {
-                "url": url,
-                "vQuality": "max" if quality == "max" else quality,
-                "filenamePattern": "classic",
-                "isAudioOnly": is_audio,
-                "aFormat": "mp3" if is_audio else "best",
-                "isAudioMuted": False,
-                "dubLang": False
-            }
+            loop = asyncio.get_event_loop()
             
-            headers = {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    api_url,
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
+            def download_sync():
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
                     
-                    if response.status == 200:
-                        data = await response.json()
-                        
-                        status = data.get('status')
-                        
-                        if status == 'stream' or status == 'redirect':
-                            download_url = data.get('url')
-                            if download_url:
-                                logger.info("Cobalt API success")
-                                return download_url
-                        
-                        elif status == 'picker':
-                            picker = data.get('picker', [])
-                            if picker:
-                                logger.info("Cobalt picker success")
-                                return picker[0].get('url')
-                    
+                    # Get filename
+                    if is_audio:
+                        filename = ydl.prepare_filename(info)
+                        filename = filename.rsplit('.', 1)[0] + '.mp3'
                     else:
-                        error_text = await response.text()
-                        logger.warning(f"Cobalt returned {response.status}: {error_text[:200]}")
-                        
-        except Exception as e:
-            logger.error(f"Cobalt failed: {e}")
-        
-        return None
-    
-    async def get_download_url(self, url: str, quality: str = "720") -> Optional[str]:
-        """Try all APIs in sequence"""
-        
-        logger.info(f"Attempting download for: {url}")
-        
-        # Try Cobalt first (most reliable when it works)
-        download_url = await self.download_with_cobalt_fixed(url, quality)
-        if download_url:
-            return download_url
-        
-        # Try API 1
-        download_url = await self.download_with_api1(url, quality)
-        if download_url:
-            return download_url
-        
-        # Try API 2
-        download_url = await self.download_with_api2(url, quality)
-        if download_url:
-            return download_url
-        
-        # Try API 3 (Instagram specific)
-        download_url = await self.download_with_api3(url, quality)
-        if download_url:
-            return download_url
-        
-        logger.error("All APIs failed")
-        return None
-    
-    async def download_file(self, download_url: str, is_audio: bool = False) -> Optional[str]:
-        """Download file from direct URL"""
-        
-        ext = 'mp3' if is_audio else 'mp4'
-        filename = f"{int(time.time())}.{ext}"
-        filepath = os.path.join(self.temp_dir, filename)
-        
-        try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+                        filename = ydl.prepare_filename(info)
+                    
+                    return filename
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    download_url,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=300)
-                ) as response:
-                    
-                    if response.status != 200:
-                        logger.error(f"Download failed: HTTP {response.status}")
-                        return None
-                    
-                    # Download file in chunks
-                    with open(filepath, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(8192):
-                            f.write(chunk)
-                    
-                    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                        logger.info(f"Downloaded: {filepath} ({self.format_bytes(os.path.getsize(filepath))})")
-                        return filepath
-                    
-                    return None
-                    
+            filepath = await loop.run_in_executor(None, download_sync)
+            
+            if filepath and os.path.exists(filepath):
+                size = os.path.getsize(filepath)
+                logger.info(f"Downloaded: {filepath} ({self.format_bytes(size)})")
+                return filepath
+            
+            return None
+            
         except Exception as e:
             logger.error(f"Download error: {e}")
-            if os.path.exists(filepath):
-                os.remove(filepath)
-            return None
-    
-    async def download_video(self, url: str, quality: str = "720") -> Optional[str]:
-        """Main download function"""
-        
-        try:
-            # Get download URL from APIs
-            download_url = await self.get_download_url(url, quality)
-            
-            if not download_url:
-                logger.error("Failed to get download URL from any API")
-                return None
-            
-            logger.info(f"Got download URL: {download_url[:100]}")
-            
-            # Download the file
-            is_audio = quality == "audio"
-            filepath = await self.download_file(download_url, is_audio)
-            
-            return filepath
-            
-        except Exception as e:
-            logger.error(f"Download failed: {e}")
             return None
     
     def cleanup(self, filepath: str):
-        """Delete file"""
         try:
             if filepath and os.path.exists(filepath):
                 os.remove(filepath)
-                logger.info(f"Cleaned: {filepath}")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
     
     def cleanup_old_files(self):
-        """Clean old files"""
         try:
             now = time.time()
             for filename in os.listdir(self.temp_dir):
                 filepath = os.path.join(self.temp_dir, filename)
                 if os.path.isfile(filepath):
-                    age = now - os.path.getmtime(filepath)
-                    if age > 3600:  # 1 hour
+                    if now - os.path.getmtime(filepath) > 3600:
                         os.remove(filepath)
-                        logger.info(f"Cleaned old: {filename}")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
-# ==================== COMMAND HANDLERS ====================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start"""
+downloader = VideoDownloader()
+
+# ==================== TELEGRAM HANDLERS ====================
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
     if not data_manager.is_authorized(user.id):
         await update.message.reply_text(
-            f"⚠️ **Access Denied**\n\n"
+            f"⚠️ Access Denied\n\n"
             f"Your ID: `{user.id}`\n"
             f"Username: @{user.username or 'None'}\n\n"
             f"Contact admin for access.",
             parse_mode=ParseMode.MARKDOWN
         )
         
-        # Notify admin
         try:
             await context.bot.send_message(
                 ADMIN_ID,
-                f"🔔 New user request\n\n"
+                f"🔔 New user:\n"
                 f"Name: {user.full_name}\n"
-                f"Username: @{user.username or 'None'}\n"
-                f"ID: `{user.id}`\n\n"
+                f"ID: `{user.id}`\n"
+                f"Username: @{user.username or 'None'}\n\n"
                 f"Authorize: `/adduser {user.id}`",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -557,98 +302,88 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     await update.message.reply_text(
-        f"👋 Hello {user.first_name}!\n\n" + WELCOME_MESSAGE,
+        f"👋 Welcome {user.first_name}!\n\n"
+        f"🎬 Send me any video URL from:\n"
+        f"• YouTube\n"
+        f"• Instagram\n"
+        f"• TikTok\n"
+        f"• Twitter\n"
+        f"• Facebook\n"
+        f"• And more!\n\n"
+        f"I'll send you the video!\n\n"
+        f"Type /help for more info."
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 **How to Use**\n\n"
+        "1. Send me a video URL\n"
+        "2. Select quality\n"
+        "3. Get your video!\n\n"
+        "**Commands:**\n"
+        "/start - Start bot\n"
+        "/help - This message\n"
+        "/stats - Your stats\n\n"
+        "**Admin:**\n"
+        "/adduser <id>\n"
+        "/removeuser <id>\n"
+        "/listusers\n"
+        "/globalstats",
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help"""
-    await update.message.reply_text(HELP_MESSAGE, parse_mode=ParseMode.MARKDOWN)
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats"""
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data_manager.is_authorized(update.effective_user.id):
         return
     
-    user_id = update.effective_user.id
-    downloads = data_manager.stats.get('user_downloads', {}).get(str(user_id), 0)
+    user_id = str(update.effective_user.id)
+    downloads = data_manager.stats.get('users', {}).get(user_id, 0)
     
     await update.message.reply_text(
         f"📊 **Your Stats**\n\n"
-        f"Downloads: {downloads}\n\n"
-        f"Thank you! 🙏",
+        f"Downloads: {downloads}",
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def platforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /platforms"""
-    platforms = """
-🌐 **Supported Platforms**
-
-✅ YouTube
-✅ Instagram  
-✅ TikTok
-✅ Twitter/X
-✅ Facebook
-✅ Reddit
-✅ Pinterest
-✅ Vimeo
-✅ Streamable
-✅ SoundCloud
-✅ Dailymotion
-✅ Twitch
-
-And many more!
-
-Just send any video URL!
-"""
-    await update.message.reply_text(platforms, parse_mode=ParseMode.MARKDOWN)
-
-async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /adduser"""
+async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: `/adduser <user_id>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage: /adduser <user_id>")
         return
     
     try:
         new_user_id = int(context.args[0])
         data_manager.add_user(new_user_id)
-        
-        await update.message.reply_text(f"✅ Added user `{new_user_id}`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"✅ Added user {new_user_id}")
         
         try:
             await context.bot.send_message(
                 new_user_id,
-                "🎉 Access granted! Send /start to begin.",
-                parse_mode=ParseMode.MARKDOWN
+                "🎉 Access granted!\nSend /start to begin."
             )
         except:
             pass
-            
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID")
 
-async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /removeuser"""
+async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: `/removeuser <user_id>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage: /removeuser <user_id>")
         return
     
     try:
         user_id = int(context.args[0])
         data_manager.remove_user(user_id)
-        await update.message.reply_text(f"✅ Removed user `{user_id}`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"✅ Removed user {user_id}")
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID")
 
-async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /listusers"""
+async def listusers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     
@@ -656,34 +391,33 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_list = "\n".join([f"`{uid}`" for uid in users])
     
     await update.message.reply_text(
-        f"📝 **Authorized Users ({len(users)})**\n\n{user_list}",
+        f"📝 **Users ({len(users)})**\n\n{user_list}",
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def globalstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /globalstats"""
+async def globalstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     
     stats = data_manager.stats
-    total = stats.get('total_downloads', 0)
+    total = stats.get('total', 0)
     users = len(data_manager.authorized_users)
     
-    platform_stats = stats.get('platform_stats', {})
-    platform_text = "\n".join([f"• {p}: {c}" for p, c in sorted(platform_stats.items(), key=lambda x: x[1], reverse=True)[:10]])
+    platforms = stats.get('platforms', {})
+    platform_text = "\n".join([
+        f"• {p}: {c}" 
+        for p, c in sorted(platforms.items(), key=lambda x: x[1], reverse=True)[:5]
+    ])
     
     await update.message.reply_text(
         f"📊 **Global Stats**\n\n"
-        f"Total Downloads: {total}\n"
+        f"Downloads: {total}\n"
         f"Users: {users}\n\n"
-        f"**Top Platforms:**\n{platform_text or 'None'}",
+        f"**Platforms:**\n{platform_text or 'None'}",
         parse_mode=ParseMode.MARKDOWN
     )
 
-# ==================== URL HANDLER ====================
-
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle video URLs"""
     user_id = update.effective_user.id
     
     if not data_manager.is_authorized(user_id):
@@ -692,7 +426,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     url = update.message.text.strip()
     
-    # Validate URL
     if not url.startswith(('http://', 'https://')):
         await update.message.reply_text("❌ Invalid URL")
         return
@@ -702,20 +435,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         platform = downloader.get_platform(url)
         
-        # Quality options
-        qualities = [
-            ('1080p (Full HD)', '1080'),
-            ('720p (HD)', '720'),
-            ('480p (SD)', '480'),
-            ('360p', '360'),
-            ('🎵 Audio Only', 'audio'),
+        # Quality buttons
+        keyboard = [
+            [InlineKeyboardButton("1080p", callback_data=f"dl_1080_{hash(url) % 10000}")],
+            [InlineKeyboardButton("720p (Recommended)", callback_data=f"dl_720_{hash(url) % 10000}")],
+            [InlineKeyboardButton("480p", callback_data=f"dl_480_{hash(url) % 10000}")],
+            [InlineKeyboardButton("360p", callback_data=f"dl_360_{hash(url) % 10000}")],
+            [InlineKeyboardButton("🎵 Audio Only", callback_data=f"dl_audio_{hash(url) % 10000}")],
         ]
-        
-        # Create buttons
-        keyboard = []
-        for label, value in qualities:
-            callback_data = f"dl_{value}_{abs(hash(url)) % 10000}"
-            keyboard.append([InlineKeyboardButton(label, callback_data=callback_data)])
         
         # Store URL
         if 'user_data' not in context.bot_data:
@@ -727,7 +454,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data['user_data'][user_id]['platform'] = platform
         
         await msg.edit_text(
-            f"✅ **Video Found**\n\n"
+            f"✅ **Ready to download**\n\n"
             f"Platform: {platform}\n\n"
             f"Select quality:",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -735,11 +462,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"URL handler error: {e}")
         await msg.edit_text("❌ Error processing URL")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle quality selection"""
     query = update.callback_query
     user_id = query.from_user.id
     
@@ -763,20 +489,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         await query.message.edit_text(
-            f"⬇️ **Downloading**\n\n"
+            f"⬇️ Downloading...\n\n"
             f"Quality: {quality}\n"
             f"Platform: {platform}\n\n"
-            f"Please wait...",
-            parse_mode=ParseMode.MARKDOWN
+            f"Please wait..."
         )
         
         # Download
-        filepath = await downloader.download_video(url, quality)
+        filepath = await downloader.download(url, quality)
         
         if not filepath:
             await query.message.edit_text(
-                "❌ **Download Failed**\n\n"
-                "Possible reasons:\n"
+                "❌ **Download failed**\n\n"
+                "Reasons:\n"
                 "• Video is private\n"
                 "• Platform blocking\n"
                 "• Invalid URL\n\n"
@@ -787,7 +512,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check size
         size = os.path.getsize(filepath)
         
-        if size > TELEGRAM_FILE_SIZE_LIMIT:
+        if size > TELEGRAM_FILE_LIMIT:
             await query.message.edit_text(
                 f"❌ **File too large**\n\n"
                 f"Size: {downloader.format_bytes(size)}\n"
@@ -797,7 +522,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             downloader.cleanup(filepath)
             return
         
-        await query.message.edit_text(f"📤 Uploading... ({downloader.format_bytes(size)})")
+        await query.message.edit_text(
+            f"📤 Uploading...\n\n{downloader.format_bytes(size)}"
+        )
         
         # Send file
         is_audio = quality == 'audio'
@@ -805,27 +532,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(filepath, 'rb') as f:
             if is_audio:
                 await context.bot.send_audio(
-                    user_id,
-                    f,
-                    caption=f"🎵 {platform} | Audio",
-                    read_timeout=60,
-                    write_timeout=60
+                    user_id, f,
+                    caption=f"🎵 {platform}",
+                    read_timeout=60, write_timeout=60
                 )
             else:
                 await context.bot.send_video(
-                    user_id,
-                    f,
+                    user_id, f,
                     caption=f"🎬 {platform} | {quality}",
                     supports_streaming=True,
-                    read_timeout=60,
-                    write_timeout=60
+                    read_timeout=60, write_timeout=60
                 )
         
-        # Record stats
-        data_manager.record_download(user_id, platform, quality)
+        # Stats
+        data_manager.record_download(user_id, platform)
         
         await query.message.delete()
-        await context.bot.send_message(user_id, "✅ Done! Send another URL.")
+        await context.bot.send_message(user_id, "✅ Done!\n\nSend another URL.")
         
         # Cleanup
         downloader.cleanup(filepath)
@@ -840,34 +563,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Global error handler"""
     logger.error(f"Error: {context.error}")
 
-# ==================== MAIN ====================
+# ==================== BOT SETUP ====================
 
-async def post_init(application: Application):
-    """Post init"""
+async def post_init(app: Application):
     try:
         commands = [
             BotCommand("start", "Start bot"),
-            BotCommand("help", "Show help"),
+            BotCommand("help", "Help"),
             BotCommand("stats", "Your stats"),
-            BotCommand("platforms", "Supported platforms"),
         ]
-        await application.bot.set_my_commands(commands)
+        await app.bot.set_my_commands(commands)
         
-        bot = await application.bot.get_me()
-        logger.info(f"Bot started: @{bot.username}")
-        logger.info(f"Admin: {ADMIN_ID}")
-        logger.info(f"Users: {len(data_manager.authorized_users)}")
+        bot = await app.bot.get_me()
+        logger.info(f"✅ Bot: @{bot.username}")
+        logger.info(f"✅ Admin: {ADMIN_ID}")
+        logger.info(f"✅ Users: {len(data_manager.authorized_users)}")
         
         downloader.cleanup_old_files()
+        
+        # Start web server
+        await start_web_server()
+        
     except Exception as e:
         logger.error(f"Init error: {e}")
 
 def main():
-    """Main function"""
-    
     logger.info("🚀 Starting bot...")
     
     try:
@@ -881,14 +603,13 @@ def main():
         )
         
         # Handlers
-        app.add_handler(CommandHandler("start", start_command))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("stats", stats_command))
-        app.add_handler(CommandHandler("platforms", platforms_command))
-        app.add_handler(CommandHandler("adduser", adduser_command))
-        app.add_handler(CommandHandler("removeuser", removeuser_command))
-        app.add_handler(CommandHandler("listusers", listusers_command))
-        app.add_handler(CommandHandler("globalstats", globalstats_command))
+        app.add_handler(CommandHandler("start", start_cmd))
+        app.add_handler(CommandHandler("help", help_cmd))
+        app.add_handler(CommandHandler("stats", stats_cmd))
+        app.add_handler(CommandHandler("adduser", adduser_cmd))
+        app.add_handler(CommandHandler("removeuser", removeuser_cmd))
+        app.add_handler(CommandHandler("listusers", listusers_cmd))
+        app.add_handler(CommandHandler("globalstats", globalstats_cmd))
         
         app.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.Regex(r'https?://'),
@@ -899,11 +620,11 @@ def main():
         app.add_error_handler(error_handler)
         
         # Run
-        logger.info("✅ Starting polling mode")
+        logger.info("✅ Running in polling mode with web server")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal: {e}")
         sys.exit(1)
 
 if __name__ == '__main__':
