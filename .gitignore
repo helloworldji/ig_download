@@ -5,3 +5,5 @@ __pycache__/
 .env
 authorized_users.json
 stats.json
+.venv/
+venv/
