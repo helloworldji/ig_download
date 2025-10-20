@@ -1,9 +1,5 @@
 downloads/
+*.json
 *.log
 __pycache__/
-*.pyc
 .env
-authorized_users.json
-stats.json
-.venv/
-venv/
