@@ -1,0 +1,6 @@
+.env
+downloads/
+*.log
+__pycache__/
+authorized_users.json
+stats.json
